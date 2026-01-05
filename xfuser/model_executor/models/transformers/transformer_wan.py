@@ -15,6 +15,60 @@ from xfuser.envs import PACKAGES_CHECKER
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
 
+
+import triton
+import triton.language as tl
+
+def get_all_config():
+    configs = []
+    for num_warps in [8]:
+        for num_stages in [4]:
+            for head_loading_stride in [8]:
+                configs.append(triton.Config(
+                    {"head_loading_stride":head_loading_stride,"num_stages":num_stages}, 
+                    num_warps=num_warps
+                ))
+    return configs
+
+@triton.autotune(
+    configs=get_all_config(),
+    key=['hs', 'hn', 'token_num'],
+)
+@triton.jit
+def xdit_rope(q_ptr,k_ptr,cos_freq,sin_freq,q_out,k_out,
+            hs:tl.constexpr,
+            hn:tl.constexpr ,
+            token_num:tl.constexpr,
+            head_loading_stride:tl.constexpr,
+            num_stages:tl.constexpr
+            ):
+    # tl.static_assert(hn % head_loading_stride == 0, "ERROR")
+    program_num = tl.num_programs(0)
+    for program_id in tl.range(tl.program_id(0), token_num, program_num):
+        freq_offset = program_id * hs
+        qk_offset = program_id * hs * hn
+        half_hs:tl.constexpr = hs // 2
+        num_pairs:tl.constexpr = head_loading_stride * half_hs
+        pair_idx = tl.arange(0,num_pairs) # [0,1,2,...,head_loading_stride * half_hs - 1]
+        head_idx_in_pair = pair_idx // half_hs # the head index for each data in each pair [0,0,0,...,0,1,1,1,...,1,...]
+        pair_idx_in_head = pair_idx % half_hs # the pair index for each head [0,1,2,...,63,0,1,2,...,63]
+        for head_idx in tl.range(0,hn,head_loading_stride,num_stages = num_stages):
+            base_offset = qk_offset + head_idx * hs
+            even_offset = base_offset + head_idx_in_pair * hs + pair_idx_in_head * 2
+            odd_offset = even_offset + 1
+            mask = head_idx + head_idx_in_pair < hn
+            q_x1 = tl.load(q_ptr + even_offset, mask = mask)
+            q_x2 = tl.load(q_ptr + odd_offset, mask = mask)
+            k_x1 = tl.load(k_ptr + even_offset, mask = mask)
+            k_x2 = tl.load(k_ptr + odd_offset, mask = mask)
+            sin_cache = tl.load(sin_freq + freq_offset + pair_idx_in_head * 2 + 1,mask = mask)
+            cos_cache = tl.load(cos_freq + freq_offset + pair_idx_in_head * 2,mask = mask)
+            tl.store(q_out + even_offset,tl.cast(q_x1 * cos_cache - q_x2 * sin_cache,tl.bfloat16),mask = mask)
+            tl.store(q_out + odd_offset,tl.cast(q_x1 * sin_cache + q_x2 * cos_cache,tl.bfloat16),mask = mask)
+            tl.store(k_out + even_offset,tl.cast(k_x1 * cos_cache - k_x2 * sin_cache,tl.bfloat16),mask = mask)
+            tl.store(k_out + odd_offset,tl.cast(k_x1 * sin_cache + k_x2 * cos_cache,tl.bfloat16),mask = mask)
+
+
 @xFuserAttentionProcessorRegister.register(WanAttnProcessor)
 class xFuserWanAttnProcessor(WanAttnProcessor):
 
@@ -81,22 +135,26 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         value = value.unflatten(2, (attn.heads, -1))
 
         if rotary_emb is not None:
+            bs,seq_q,hn_q,hs = query.shape
+            _,seq_k,hn_k,_ = key.shape
+            if seq_q == seq_k and hn_q == hn_k:
+                xdit_rope[(seq_q,1,1)](query, key, rotary_emb[0],rotary_emb[1], query, key, hs, hn_q, seq_q)
+            else:
+                def apply_rotary_emb(
+                    hidden_states: torch.Tensor,
+                    freqs_cos: torch.Tensor,
+                    freqs_sin: torch.Tensor,
+                ):
+                    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+                    cos = freqs_cos[..., 0::2]
+                    sin = freqs_sin[..., 1::2]
+                    out = torch.empty_like(hidden_states)
+                    out[..., 0::2] = x1 * cos - x2 * sin
+                    out[..., 1::2] = x1 * sin + x2 * cos
+                    return out.type_as(hidden_states)
 
-            def apply_rotary_emb(
-                hidden_states: torch.Tensor,
-                freqs_cos: torch.Tensor,
-                freqs_sin: torch.Tensor,
-            ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
-                out[..., 0::2] = x1 * cos - x2 * sin
-                out[..., 1::2] = x1 * sin + x2 * cos
-                return out.type_as(hidden_states)
-
-            query = apply_rotary_emb(query, *rotary_emb)
-            key = apply_rotary_emb(key, *rotary_emb)
+                query = apply_rotary_emb(query, *rotary_emb)
+                key = apply_rotary_emb(key, *rotary_emb)
 
         # I2V task
         hidden_states_img = None
